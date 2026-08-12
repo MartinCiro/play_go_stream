@@ -12,15 +12,17 @@ import (
 
 // StreamHandler maneja las peticiones HTTP del servidor de música
 type StreamHandler struct {
-	config       *Config
-	musicService *MusicService
+	config          *Config
+	musicService    *MusicService
+	playbackHandler *PlaybackHandler
 }
 
 // NewStreamHandler crea un nuevo handler
-func NewStreamHandler(config *Config, musicService *MusicService) *StreamHandler {
+func NewStreamHandler(config *Config, musicService *MusicService, playback *PlaybackController) *StreamHandler {
 	return &StreamHandler{
-		config:       config,
-		musicService: musicService,
+		config:          config,
+		musicService:    musicService,
+		playbackHandler: NewPlaybackHandler(config, playback),
 	}
 }
 
@@ -28,7 +30,7 @@ func NewStreamHandler(config *Config, musicService *MusicService) *StreamHandler
 func (h *StreamHandler) Start() error {
 	mux := http.NewServeMux()
 
-	// API endpoints
+	// API endpoints de biblioteca
 	mux.HandleFunc("/api/library", h.handleLibrary)
 	mux.HandleFunc("/api/search", h.handleSearch)
 	mux.HandleFunc("/api/song/", h.handleSongInfo)
@@ -36,6 +38,9 @@ func (h *StreamHandler) Start() error {
 
 	// Streaming endpoint
 	mux.HandleFunc("/stream/", h.handleStream)
+
+	// ← NUEVO: Registrar rutas de playback
+	h.playbackHandler.RegisterRoutes(mux)
 
 	// CORS middleware wrapper
 	handler := h.corsMiddleware(mux)

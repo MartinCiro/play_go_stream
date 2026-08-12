@@ -20,7 +20,8 @@ func main() {
 
 	// 2️⃣ Instanciar servicios
 	musicService := controller.NewMusicService(config)
-	streamHandler := controller.NewStreamHandler(config, musicService)
+	playback := controller.NewPlaybackController(config, musicService)           // ← NUEVO
+	streamHandler := controller.NewStreamHandler(config, musicService, playback) // ← MODIFICADO
 
 	config.Log.InicioProceso("Go Stream")
 	config.Log.Comentario("SUCCESS", "Servicios inicializados")
