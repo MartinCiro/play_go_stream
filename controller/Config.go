@@ -4,92 +4,94 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
 )
 
-// Config agrupa toda la configuración del servidor
+// Config configuración del servidor de música
 type Config struct {
-	ServerHost          string
-	ServerPort          int
-	MusicDir            string
-	ScanWorkers         int
-	SupportedExtensions []string
-	LogLevel            string
-	LogDir              string
+	Port       string
+	MusicPath  string
+	AllowedIPs []string
+	Log        *Log
 }
 
-// NewConfig carga la configuración desde .env con valores por defecto
+// NewConfig crea una nueva instancia de Config
 func NewConfig() *Config {
-	if _, err := os.Stat(".env"); err == nil {
+	// Cargar .env si existe
+	envPath := ".env"
+	if _, err := os.Stat(envPath); err == nil {
 		if err := godotenv.Load(); err != nil {
-			fmt.Printf("⚠️  No se pudo cargar .env: %v\n", err)
+			fmt.Printf("⚠️  Advertencia: No se pudo cargar .env: %v\n", err)
 		}
 	}
 
-	cfg := &Config{
-		ServerHost:          getEnv("SERVER_HOST", "0.0.0.0"),
-		ServerPort:          getEnvInt("SERVER_PORT", 8080),
-		MusicDir:            getEnv("MUSIC_DIR", "./music"),
-		ScanWorkers:         getEnvInt("SCAN_WORKERS", 4),
-		SupportedExtensions: parseExtensions(getEnv("SUPPORTED_EXTENSIONS", ".mp3,.flac,.ogg,.m4a,.wav")),
-		LogLevel:            getEnv("LOG_LEVEL", "INFO"),
-		LogDir:              getEnv("LOG_DIR", "./logs"),
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
 
-	// Validar directorio de música
-	if info, err := os.Stat(cfg.MusicDir); err != nil || !info.IsDir() {
-		fmt.Printf("❌ MUSIC_DIR inválido: %s\n", cfg.MusicDir)
-		os.Exit(1)
+	musicPath := os.Getenv("MUSIC_PATH")
+	if musicPath == "" {
+		musicPath = "./music"
 	}
 
-	// Asegurar que el path sea absoluto
-	if !filepath.IsAbs(cfg.MusicDir) {
-		if abs, err := filepath.Abs(cfg.MusicDir); err == nil {
-			cfg.MusicDir = abs
-		}
+	// Convertir a ruta absoluta
+	if absPath, err := filepath.Abs(musicPath); err == nil {
+		musicPath = absPath
 	}
 
-	return cfg
+	// Verificar que exista la carpeta
+	if _, err := os.Stat(musicPath); os.IsNotExist(err) {
+		fmt.Printf("⚠️  La carpeta de música no existe, creándola: %s\n", musicPath)
+		os.MkdirAll(musicPath, 0755)
+	}
+
+	allowedIPs := parseAllowedIPs(os.Getenv("ALLOWED_IPS"))
+
+	return &Config{
+		Port:       port,
+		MusicPath:  musicPath,
+		AllowedIPs: allowedIPs,
+		Log:        NewLog(),
+	}
 }
 
-// IsSupported verifica si una extensión está soportada
-func (c *Config) IsSupported(ext string) bool {
-	ext = strings.ToLower(ext)
-	for _, e := range c.SupportedExtensions {
-		if e == ext {
+// IsIPAllowed verifica si una IP está en la lista blanca
+func (c *Config) IsIPAllowed(ip string) bool {
+	if len(c.AllowedIPs) == 0 {
+		return true // Sin restricción
+	}
+	for _, allowed := range c.AllowedIPs {
+		if allowed == ip {
 			return true
 		}
 	}
 	return false
 }
 
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+func parseAllowedIPs(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
 	}
-	return fallback
-}
 
-func getEnvInt(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			return i
-		}
-	}
-	return fallback
-}
-
-func parseExtensions(raw string) []string {
+	var ips []string
 	parts := strings.Split(raw, ",")
-	result := make([]string, 0, len(parts))
 	for _, p := range parts {
-		p = strings.TrimSpace(strings.ToLower(p))
+		p = strings.TrimSpace(p)
 		if p != "" {
-			result = append(result, p)
+			ips = append(ips, p)
 		}
 	}
-	return result
+	return ips
+}
+
+// GetProjectPath retorna la ruta absoluta del proyecto
+func (c *Config) GetProjectPath() string {
+	path, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return path
 }

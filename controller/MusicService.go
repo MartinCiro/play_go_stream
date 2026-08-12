@@ -4,432 +4,172 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
-	"time"
-
-	"github.com/gopxl/beep/v2"
-	"github.com/gopxl/beep/v2/flac"
-	"github.com/gopxl/beep/v2/mp3"
-	"github.com/gopxl/beep/v2/speaker"
-	"github.com/gopxl/beep/v2/vorbis"
-	"github.com/gopxl/beep/v2/wav"
 )
 
-// MusicState representa el estado actual del reproductor
-type MusicState struct {
-	Playing  bool          `json:"playing"`
-	Paused   bool          `json:"paused"`
-	Current  *Track        `json:"current"`
-	Volume   float64       `json:"volume"`
-	Position time.Duration `json:"position"`
-	Duration time.Duration `json:"duration"`
+// Song representa una canción en la biblioteca
+type Song struct {
+	ID       string  `json:"id"`
+	Title    string  `json:"title"`
+	Artist   string  `json:"artist"`
+	Filename string  `json:"filename"`
+	Path     string  `json:"path"`
+	Size     int64   `json:"size"`
+	Duration float64 `json:"duration"` // en segundos (si se lee metadata)
 }
 
-// MusicService gestiona la reproducción de audio
+// MusicService gestiona la biblioteca de música
 type MusicService struct {
-	mu           sync.RWMutex
-	log          *Logger
-	libraryPath  string
-	tracks       []*Track
-	streamer     beep.StreamSeekCloser
-	ctrl         *beep.Ctrl
-	volume       *beep.Volume
-	currentTrack *Track
-	playing      bool
-	paused       bool
-	done         chan struct{}
-	sampleRate   beep.SampleRate
-	initialized  bool
+	config *Config
+	songs  map[string]*Song
+	mu     sync.RWMutex
 }
 
-// NewMusicService crea una nueva instancia del servicio
+// NewMusicService crea un nuevo servicio de música
 func NewMusicService(config *Config) *MusicService {
 	return &MusicService{
-		log:         config.LogDir,
-		libraryPath: config.MusicLibraryPath,
-		tracks:      make([]*Track, 0),
-		volume: &beep.Volume{
-			Base:   1,
-			Silent: false,
-		},
-		done:       make(chan struct{}),
-		sampleRate: 44100,
+		config: config,
+		songs:  make(map[string]*Song),
 	}
 }
 
-// Initialize prepara el speaker y carga la librería
-func (m *MusicService) Initialize() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// LoadLibrary escanea la carpeta de música y carga todas las canciones
+func (s *MusicService) LoadLibrary() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	if m.initialized {
-		return nil
+	// Limpiar biblioteca anterior
+	s.songs = make(map[string]*Song)
+
+	if s.config.Log != nil {
+		s.config.Log.Comentario("INFO", fmt.Sprintf("Escaneando biblioteca en: %s", s.config.MusicPath))
 	}
 
-	// Inicializar speaker (44100 Hz es estándar)
-	if err := speaker.Init(m.sampleRate, m.sampleRate.N(time.Second/10)); err != nil {
-		if m.log != nil {
-			m.log.Error(fmt.Sprintf("No se pudo inicializar el speaker: %v", err), "MusicService")
-		}
-		return fmt.Errorf("error inicializando speaker: %v", err)
-	}
-
-	// Cargar librería
-	if err := m.loadLibrary(); err != nil {
-		return err
-	}
-
-	m.initialized = true
-
-	if m.log != nil {
-		m.log.Comentario("SUCCESS", fmt.Sprintf("MusicService inicializado: %d canciones cargadas", len(m.tracks)))
-	}
-
-	return nil
-}
-
-// loadLibrary escanea la carpeta de música y carga los archivos
-func (m *MusicService) loadLibrary() error {
-	if m.libraryPath == "" {
-		return fmt.Errorf("ruta de librería no configurada (MUSIC_LIBRARY_PATH)")
-	}
-
-	if _, err := os.Stat(m.libraryPath); os.IsNotExist(err) {
-		return fmt.Errorf("la carpeta de música no existe: %s", m.libraryPath)
-	}
-
-	m.tracks = m.tracks[:0] // Limpiar lista
-
-	extensions := map[string]bool{
+	// Extensiones de audio soportadas
+	audioExts := map[string]bool{
 		".mp3":  true,
 		".flac": true,
 		".wav":  true,
 		".ogg":  true,
+		".m4a":  true,
+		".aac":  true,
+		".opus": true,
 	}
 
-	err := filepath.Walk(m.libraryPath, func(path string, info os.FileInfo, err error) error {
+	count := 0
+
+	err := filepath.Walk(s.config.MusicPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			return nil // Continuar si hay error en un archivo
 		}
+
 		if info.IsDir() {
 			return nil
 		}
 
-		ext := strings.ToLower(filepath.Ext(info.Name()))
-		if !extensions[ext] {
+		ext := strings.ToLower(filepath.Ext(path))
+		if !audioExts[ext] {
 			return nil
 		}
 
-		track, err := m.scanTrack(path)
-		if err != nil {
-			if m.log != nil {
-				m.log.Comentario("WARNING", fmt.Sprintf("No se pudo escanear %s: %v", info.Name(), err))
-			}
-			return nil
+		// Generar ID basado en ruta relativa
+		relPath, _ := filepath.Rel(s.config.MusicPath, path)
+		id := strings.ReplaceAll(relPath, string(os.PathSeparator), "_")
+		id = strings.ReplaceAll(id, " ", "_")
+
+		// Extraer título del nombre del archivo (sin extensión)
+		title := strings.TrimSuffix(info.Name(), ext)
+		artist := "Desconocido"
+
+		// Intentar extraer "Artista - Título" del nombre
+		if parts := strings.SplitN(title, " - ", 2); len(parts) == 2 {
+			artist = parts[0]
+			title = parts[1]
 		}
 
-		m.tracks = append(m.tracks, track)
+		song := &Song{
+			ID:       id,
+			Title:    title,
+			Artist:   artist,
+			Filename: info.Name(),
+			Path:     path,
+			Size:     info.Size(),
+			Duration: 0, // TODO: leer metadata con librería como go-taglib
+		}
+
+		s.songs[id] = song
+		count++
+
 		return nil
 	})
 
 	if err != nil {
-		return fmt.Errorf("error escaneando librería: %v", err)
+		return fmt.Errorf("error escaneando biblioteca: %v", err)
 	}
 
-	// Ordenar por título
-	sort.Slice(m.tracks, func(i, j int) bool {
-		return m.tracks[i].Title < m.tracks[j].Title
-	})
+	if s.config.Log != nil {
+		s.config.Log.Comentario("SUCCESS", fmt.Sprintf("Biblioteca cargada: %d canciones", count))
+	}
 
 	return nil
 }
 
-// scanTrack analiza un archivo y extrae metadatos básicos
-func (m *MusicService) scanTrack(path string) (*Track, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
+// GetAll retorna todas las canciones
+func (s *MusicService) GetAll() []*Song {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make([]*Song, 0, len(s.songs))
+	for _, song := range s.songs {
+		result = append(result, song)
 	}
-	defer file.Close()
-
-	var streamer beep.StreamSeekCloser
-	var format beep.Format
-
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".mp3":
-		streamer, format, err = mp3.Decode(file)
-	case ".flac":
-		streamer, format, err = flac.Decode(file)
-	case ".wav":
-		streamer, format, err = wav.Decode(file)
-	case ".ogg":
-		streamer, format, err = vorbis.Decode(file)
-	default:
-		return nil, fmt.Errorf("formato no soportado: %s", ext)
-	}
-
-	if err != nil {
-		return nil, err
-	}
-	defer streamer.Close()
-
-	// Generar ID basado en el nombre del archivo
-	baseName := strings.TrimSuffix(filepath.Base(path), ext)
-	id := fmt.Sprintf("%x", time.Now().UnixNano())[:8]
-
-	// Título por defecto = nombre del archivo sin extensión
-	title := baseName
-	artist := "Desconocido"
-
-	return &Track{
-		ID:       id,
-		Title:    title,
-		Artist:   artist,
-		Filename: path,
-		Duration: format.SampleRate.D(streamer.Len()),
-	}, nil
-}
-
-// ListTracks retorna la lista de canciones disponibles
-func (m *MusicService) ListTracks() []*Track {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	// Copia defensiva
-	result := make([]*Track, len(m.tracks))
-	copy(result, m.tracks)
 	return result
 }
 
-// Play reproduce una canción por ID
-func (m *MusicService) Play(trackID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// GetByID retorna una canción por su ID
+func (s *MusicService) GetByID(id string) (*Song, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	// Buscar track
-	var target *Track
-	for _, t := range m.tracks {
-		if t.ID == trackID {
-			target = t
-			break
+	song, exists := s.songs[id]
+	return song, exists
+}
+
+// Search busca canciones por título o artista
+func (s *MusicService) Search(query string) []*Song {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query = strings.ToLower(query)
+	var results []*Song
+
+	for _, song := range s.songs {
+		if strings.Contains(strings.ToLower(song.Title), query) ||
+			strings.Contains(strings.ToLower(song.Artist), query) {
+			results = append(results, song)
 		}
 	}
 
-	if target == nil {
-		return fmt.Errorf("canción no encontrada: %s", trackID)
-	}
-
-	// Detener reproducción actual si existe
-	if m.playing {
-		m.stopLocked()
-	}
-
-	// Abrir archivo
-	file, err := os.Open(target.Filename)
-	if err != nil {
-		return fmt.Errorf("error abriendo archivo: %v", err)
-	}
-
-	var streamer beep.StreamSeekCloser
-	var format beep.Format
-
-	ext := strings.ToLower(filepath.Ext(target.Filename))
-	switch ext {
-	case ".mp3":
-		streamer, format, err = mp3.Decode(file)
-	case ".flac":
-		streamer, format, err = flac.Decode(file)
-	case ".wav":
-		streamer, format, err = wav.Decode(file)
-	case ".ogg":
-		streamer, format, err = vorbis.Decode(file)
-	}
-
-	if err != nil {
-		file.Close()
-		return fmt.Errorf("error decodificando: %v", err)
-	}
-
-	// Resample si es necesario (para uniformar)
-	resampled := beep.Resample(4, format.SampleRate, m.sampleRate, streamer)
-
-	// Construir cadena: streamer -> volume -> ctrl
-	m.streamer = streamer
-	m.volume.Streamer = resampled
-	m.ctrl = &beep.Ctrl{Streamer: m.volume}
-
-	done := make(chan bool)
-	speaker.Play(beep.Seq(m.ctrl, beep.Callback(func() {
-		done <- true
-	})))
-
-	m.currentTrack = target
-	m.playing = true
-	m.paused = false
-
-	if m.log != nil {
-		m.log.Comentario("INFO", fmt.Sprintf("Reproduciendo: %s - %s", target.Artist, target.Title))
-	}
-
-	// Goroutine para detectar fin de canción
-	go func() {
-		<-done
-		m.mu.Lock()
-		m.playing = false
-		m.paused = false
-		m.streamer.Close()
-		file.Close()
-		m.mu.Unlock()
-
-		if m.log != nil {
-			m.log.Comentario("INFO", "Canción finalizada")
-		}
-	}()
-
-	return nil
+	return results
 }
 
-// Pause pausa la reproducción
-func (m *MusicService) Pause() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if !m.playing || m.paused {
-		return fmt.Errorf("no hay música reproduciéndose")
-	}
-
-	speaker.Lock()
-	m.ctrl.Paused = true
-	speaker.Unlock()
-
-	m.paused = true
-
-	if m.log != nil {
-		m.log.Comentario("INFO", "Reproducción pausada")
-	}
-
-	return nil
+// Count retorna el número de canciones
+func (s *MusicService) Count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.songs)
 }
 
-// Resume continúa la reproducción
-func (m *MusicService) Resume() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// GetFilePath retorna la ruta física de una canción
+func (s *MusicService) GetFilePath(id string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	if !m.playing || !m.paused {
-		return fmt.Errorf("no hay música pausada")
+	song, exists := s.songs[id]
+	if !exists {
+		return "", fmt.Errorf("canción no encontrada: %s", id)
 	}
 
-	speaker.Lock()
-	m.ctrl.Paused = false
-	speaker.Unlock()
-
-	m.paused = false
-
-	if m.log != nil {
-		m.log.Comentario("INFO", "Reproducción reanudada")
-	}
-
-	return nil
-}
-
-// Stop detiene la reproducción
-func (m *MusicService) Stop() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if !m.playing {
-		return fmt.Errorf("no hay música reproduciéndose")
-	}
-
-	m.stopLocked()
-
-	if m.log != nil {
-		m.log.Comentario("INFO", "Reproducción detenida")
-	}
-
-	return nil
-}
-
-// stopLocked detiene la reproducción (asume que el mutex está tomado)
-func (m *MusicService) stopLocked() {
-	speaker.Clear()
-
-	if m.streamer != nil {
-		m.streamer.Close()
-		m.streamer = nil
-	}
-
-	m.playing = false
-	m.paused = false
-	m.currentTrack = nil
-}
-
-// SetVolume ajusta el volumen (0.0 = silencio, 1.0 = máximo)
-func (m *MusicService) SetVolume(vol float64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if vol < 0 {
-		vol = 0
-	}
-	if vol > 1 {
-		vol = 1
-	}
-
-	speaker.Lock()
-	if m.volume != nil {
-		m.volume.Base = vol
-	}
-	speaker.Unlock()
-
-	if m.log != nil {
-		m.log.Comentario("INFO", fmt.Sprintf("Volumen ajustado a %.0f%%", vol*100))
-	}
-
-	return nil
-}
-
-// GetState retorna el estado actual del reproductor
-func (m *MusicService) GetState() MusicState {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var position time.Duration
-	var duration time.Duration
-
-	if m.currentTrack != nil && m.streamer != nil {
-		format := beep.Format{SampleRate: m.sampleRate, NumChannels: 2, Precision: 2}
-		position = m.streamer.Position().D(format)
-		duration = m.currentTrack.Duration
-	}
-
-	return MusicState{
-		Playing:  m.playing,
-		Paused:   m.paused,
-		Current:  m.currentTrack,
-		Volume:   m.volume.Base,
-		Position: position,
-		Duration: duration,
-	}
-}
-
-// Shutdown limpia recursos
-func (m *MusicService) Shutdown() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.playing {
-		m.stopLocked()
-	}
-
-	speaker.Clear()
-	speaker.Close()
-
-	if m.log != nil {
-		m.log.Comentario("INFO", "MusicService apagado")
-	}
+	return song.Path, nil
 }

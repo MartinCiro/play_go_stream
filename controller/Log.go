@@ -2,7 +2,6 @@ package controller
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,106 +9,132 @@ import (
 	"time"
 )
 
-type Level int
-
 const (
-	DEBUG Level = iota
-	INFO
-	WARN
-	ERROR
+	logAncho         = 120
+	logFormatoTiempo = "2006-01-02 15:04:05"
 )
 
-// Logger thread-safe con salida a consola y archivo
-type Logger struct {
-	level   Level
-	file    *os.File
-	mu      sync.Mutex
-	startAt time.Time
+// Log sistema de logging con escritura thread-safe
+type Log struct {
+	rutaBase        string
+	rutaProcesos    string
+	rutaErrores     string
+	archivoProcesos string
+	archivoErrores  string
+	mu              sync.Mutex
 }
 
-// NewLogger crea un logger con nivel mínimo y archivo opcional
-func NewLogger(levelStr, logDir string) *Logger {
-	level := parseLevel(levelStr)
+// NewLog crea una nueva instancia de Log
+func NewLog() *Log {
+	fechaActual := time.Now().Format("2006-01-02")
 
-	// Crear directorio de logs
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		fmt.Printf("⚠️  No se pudo crear %s: %v\n", logDir, err)
-	}
-
-	// Abrir archivo de log del día
-	logPath := filepath.Join(logDir, fmt.Sprintf("stream_%s.log",
-		time.Now().Format("2006-01-02")))
-
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	cwd, err := os.Getwd()
 	if err != nil {
-		fmt.Printf("⚠️  No se pudo abrir log file: %v\n", err)
+		cwd = "."
 	}
 
-	return &Logger{
-		level:   level,
-		file:    f,
-		startAt: time.Now(),
+	rutaBase := cwd
+	rutaProcesos := filepath.Join(rutaBase, "logs", "procesos")
+	rutaErrores := filepath.Join(rutaBase, "logs", "errores")
+
+	os.MkdirAll(rutaProcesos, 0755)
+	os.MkdirAll(rutaErrores, 0755)
+
+	archivoProcesos := filepath.Join(rutaProcesos, fmt.Sprintf("LogProcesos_%s.txt", fechaActual))
+	archivoErrores := filepath.Join(rutaErrores, fmt.Sprintf("LogErrores_%s.txt", fechaActual))
+
+	return &Log{
+		rutaBase:        rutaBase,
+		rutaProcesos:    rutaProcesos,
+		rutaErrores:     rutaErrores,
+		archivoProcesos: archivoProcesos,
+		archivoErrores:  archivoErrores,
 	}
 }
 
-// Close cierra el archivo de log
-func (l *Logger) Close() {
-	if l.file != nil {
-		l.file.Close()
-	}
+func (l *Log) tiempoActual() string {
+	return time.Now().Format(logFormatoTiempo)
 }
 
-func (l *Logger) log(level Level, prefix, msg string, args ...any) {
-	if level < l.level {
-		return
+func (l *Log) formatearMensaje(lineas ...string) string {
+	var sb strings.Builder
+	sb.WriteString(strings.Repeat("=", logAncho) + "\n")
+	for _, linea := range lineas {
+		maxLen := logAncho - 4
+		if len(linea) > maxLen {
+			linea = linea[:maxLen-3] + "..."
+		}
+		padded := linea + strings.Repeat(" ", maxLen-len(linea))
+		sb.WriteString(fmt.Sprintf("| %s |\n", padded))
 	}
+	sb.WriteString(strings.Repeat("=", logAncho) + "\n")
+	return sb.String()
+}
 
-	formatted := msg
-	if len(args) > 0 {
-		formatted = fmt.Sprintf(msg, args...)
-	}
-
-	ts := time.Now().Format("2006-01-02 15:04:05")
-	line := fmt.Sprintf("[%s] %s %s\n", ts, prefix, formatted)
-
+func (l *Log) escribirLog(archivo string, mensaje string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	io.WriteString(os.Stdout, line)
-	if l.file != nil {
-		l.file.WriteString(line)
+	f, err := os.OpenFile(archivo, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error abriendo log %s: %v\n", archivo, err)
+		return
 	}
+	defer f.Close()
+
+	f.WriteString(mensaje + "\n")
 }
 
-func (l *Logger) Debug(msg string, args ...any) { l.log(DEBUG, "🔍 DEBUG", msg, args...) }
-func (l *Logger) Info(msg string, args ...any)  { l.log(INFO, "ℹ️  INFO ", msg, args...) }
-func (l *Logger) Warn(msg string, args ...any)  { l.log(WARN, "⚠️  WARN ", msg, args...) }
-func (l *Logger) Error(msg string, args ...any) { l.log(ERROR, "❌ ERROR", msg, args...) }
-
-// InicioProceso mantiene compatibilidad con tu estilo original
-func (l *Logger) InicioProceso(name string) {
-	sep := strings.Repeat("=", 80)
-	l.Info(sep)
-	l.Info("🚀 INICIO: %s", name)
-	l.Info(sep)
-}
-
-func (l *Logger) FinProceso(name string) {
-	sep := strings.Repeat("=", 80)
-	l.Info(sep)
-	l.Info("🛑 FIN: %s (duración: %s)", name, time.Since(l.startAt).Round(time.Millisecond))
-	l.Info(sep)
-}
-
-func parseLevel(s string) Level {
-	switch strings.ToUpper(strings.TrimSpace(s)) {
-	case "DEBUG":
-		return DEBUG
-	case "WARN", "WARNING":
-		return WARN
-	case "ERROR":
-		return ERROR
-	default:
-		return INFO
+func (l *Log) InicioProceso(nombreAplicacion ...string) {
+	nombre := "Proceso"
+	if len(nombreAplicacion) > 0 && nombreAplicacion[0] != "" {
+		nombre = nombreAplicacion[0]
 	}
+	mensaje := l.formatearMensaje(
+		fmt.Sprintf("INICIO DE EJECUCIÓN - %s - %s", nombre, l.tiempoActual()),
+	)
+	l.escribirLog(l.archivoProcesos, mensaje)
+}
+
+func (l *Log) FinProceso(nombreAplicacion ...string) {
+	nombre := "Proceso"
+	if len(nombreAplicacion) > 0 && nombreAplicacion[0] != "" {
+		nombre = nombreAplicacion[0]
+	}
+	mensaje := l.formatearMensaje(
+		fmt.Sprintf("FIN DE EJECUCIÓN - %s - %s", nombre, l.tiempoActual()),
+	)
+	l.escribirLog(l.archivoProcesos, mensaje)
+}
+
+func (l *Log) Proceso(nombreProceso string) {
+	mensaje := fmt.Sprintf("| Ejecutando: %-80s | Hora: %s |", nombreProceso, l.tiempoActual())
+	l.escribirLog(l.archivoProcesos, mensaje)
+}
+
+func (l *Log) Comentario(nivel string, mensaje string) {
+	contenido := l.formatearMensaje(
+		fmt.Sprintf("%s: %s", strings.ToUpper(nivel), mensaje),
+		fmt.Sprintf("Hora: %s", l.tiempoActual()),
+	)
+	l.escribirLog(l.archivoProcesos, contenido)
+}
+
+func (l *Log) Error(descripcionError string, proceso ...string) {
+	nombreProceso := "Proceso no especificado"
+	if len(proceso) > 0 && proceso[0] != "" {
+		nombreProceso = fmt.Sprintf("Proceso: %s", proceso[0])
+	}
+
+	contenido := l.formatearMensaje(
+		fmt.Sprintf("ERROR DETECTADO - %s", l.tiempoActual()),
+		nombreProceso,
+		fmt.Sprintf("Detalle: %s", descripcionError),
+	)
+	l.escribirLog(l.archivoErrores, contenido)
+	l.escribirLog(l.archivoProcesos, contenido)
+}
+
+func (l *Log) Separador() {
+	l.escribirLog(l.archivoProcesos, strings.Repeat("=", logAncho))
 }
